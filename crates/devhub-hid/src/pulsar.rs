@@ -326,7 +326,7 @@ impl PulsarDriver {
                         break;
                     }
                     let mut buf = [0u8; 64];
-                    match dev.read_timeout(&mut buf, left.as_millis().min(120).max(1) as i32) {
+                    match dev.read_timeout(&mut buf, left.as_millis().clamp(1, 120) as i32) {
                         Ok(n) if n >= 17 && buf[0] == RID => {
                             let r = &buf[..17];
                             if cksum(r) != r[16] {
@@ -566,10 +566,10 @@ fn rot2(n: u8) -> u8 {
 /// dpi = (lo + 1 + 256*page) * 50。high の 4bit ニブルは同じ値を 2 つ並べ、
 /// rot2 すると [mode:2][page:2] になる (mode=0 = 50 刻み)。
 fn dpi_to_raw(dpi: u32) -> Option<[u8; 3]> {
-    if dpi % 50 != 0 || !(50..=26000).contains(&dpi) {
+    if !dpi.is_multiple_of(50) || !(50..=26000).contains(&dpi) {
         return None;
     }
-    let index = (dpi / 50 - 1) as u32; // 0..=519 → 10bit
+    let index = dpi / 50 - 1; // 0..=519 → 10bit
     let page = (index >> 8) as u8;
     let low = (index & 0xff) as u8;
     let nib = rot2(page);
@@ -853,10 +853,10 @@ impl DeviceDriver for PulsarDriver {
         self.maybe_detect();
         // ドングル + 休眠判定済みなら探査 1 発だけ打って、応答が無ければ早抜け
         // (全メモリ掃射で数十秒待たせない)。
-        if self.info.lock().unwrap_or_else(|p| p.into_inner()).asleep {
-            if self.cmd_raw(cmd::PROFILE_GET, 0, 0, 0, &[], 1).is_err() {
-                return Err(HubError::Disconnected);
-            }
+        if self.info.lock().unwrap_or_else(|p| p.into_inner()).asleep
+            && self.cmd_raw(cmd::PROFILE_GET, 0, 0, 0, &[], 1).is_err()
+        {
+            return Err(HubError::Disconnected);
         }
         let m = self.dump_map()?;
         let n_buttons = self
@@ -996,7 +996,7 @@ impl DeviceDriver for PulsarDriver {
                 }
                 "sleep_sec" => {
                     let sec = value.as_num();
-                    if sec < 10. || sec > 600. || sec % 10. != 0. {
+                    if !(10. ..=600.).contains(&sec) || sec % 10. != 0. {
                         return Err(HubError::Invalid("スリープは 10-600秒・10秒刻み".into()));
                     }
                     self.write_pair(ee::AUTOSLEEP, (sec / 10.) as u8)
