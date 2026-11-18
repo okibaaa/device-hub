@@ -162,6 +162,51 @@ pub const KNOWN: &[KnownDevice] = &[
         driver: DriverKind::Atk,
         verified: true,
     },
+    // ---------------------------------------------------------------- マウス (Pulsar / Nordic)
+    // Pulsar Nordic チップセット機 (Xlite V3 / X2V2 / X2A 等 21 機種が共用 ID)。
+    // 設定コレクションは ff02/u2、17B report-8 (cksum 0x55)。同一プロトコルなので
+    // 1 本のドライバで扱い、機種は cmd1 handshake の CID/MID で確定する
+    // (実機 Xlite V3: CID=6 MID=7)。ドングル 2 種 (F508=1K, F509=4K系) は中継。
+    KnownDevice {
+        vid: 0x3554,
+        pid: 0xF507, // 有線 (実機列挙・応答確認: ff02/u2, in=17 out=17)
+        usage_page: Some(0xFF02),
+        usage: Some(0x02),
+        kind: DeviceKind::Mouse,
+        vendor: "Pulsar",
+        model: "pulsar-nordic",
+        name: "Pulsar マウス",
+        transport: Transport::Wired,
+        driver: DriverKind::Pulsar,
+        verified: true,
+    },
+    KnownDevice {
+        vid: 0x3554,
+        pid: 0xF508, // 1K ワイヤレスドングル (プロトコル同一、実機未検証)
+        usage_page: Some(0xFF02),
+        usage: Some(0x02),
+        kind: DeviceKind::Mouse,
+        vendor: "Pulsar",
+        model: "pulsar-nordic",
+        name: "Pulsar ワイヤレスドングル",
+        transport: Transport::Wireless24G,
+        driver: DriverKind::Pulsar,
+        verified: false,
+    },
+    KnownDevice {
+        vid: 0x3554,
+        pid: 0xF509, // 4K ワイヤレスドングル (実機確認: 製品文字列 "Pulsar 4K Wireless Receiver"、
+                     // ff02/u2 同レイアウト。ハンドシェイク中継で CID=6/MID=7 を確認)
+        usage_page: Some(0xFF02),
+        usage: Some(0x02),
+        kind: DeviceKind::Mouse,
+        vendor: "Pulsar",
+        model: "pulsar-nordic",
+        name: "Pulsar 4K ドングル",
+        transport: Transport::Wireless24G,
+        driver: DriverKind::Pulsar,
+        verified: true,
+    },
     // ---------------------------------------------------------------- マウス (lamzu.net)
     // LAMZU Maya X V2 (LM20) 有線 — 実機列挙 37b0:0044。
     // 設定 = if2 FFFF/00 の 64B feature report、通知 = if1 FFA0/01 input report。

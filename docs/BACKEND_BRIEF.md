@@ -100,6 +100,33 @@ P2 = Web 版にあるたまに使う機能、P3 = 機種限定・リスクが高
 
 mouse.fit の機種表に無い。実機の VID/PID/usage を取り、`docs/ADD_DEVICE.md §7` で系統を決める。
 既存プロトコルで話せれば registry に足すだけ。違えば `DriverKind` を足して新ドライバ。P1。
+**→ 実装済み (`atk.rs`, 有線+ドングル実機検証、§1 現状表を参照)。**
+
+### 2.4 Pulsar Nordic (Xlite V3 ほか 21 機種)
+
+公式アプリはデスクトップの Pulsar Fusion (Web 版が無い) なので、既存オープンソース解析
+(python-pulsar-mouse-tool / pulsar-mouse-linux / hid-pulsar.c) + 実機プローブで解析。
+**→ 実装済み (`pulsar.rs`, Xlite V3 有線で全機能実機検証、PROTOCOL_NOTES §6 参照)。**
+
+| 機能 | 根拠 | 表し方 | 現状 | 優先 |
+|---|---|---|---|---|
+| 機種確定 (21 機種共用 PID) | cmd1 handshake → CID/MID | `DeviceInfo` の model/name + KM で caps | **済** (実機: 6/7 = Xlite V3) | **P0** |
+| DPI 段 (4 段・50-26000・50 刻み) + 段色 | メモリ 0x0C/0x2C | `MouseState::stages` / `Change::DpiStages` | **済** (同値往復検証) | **P0** |
+| ポーリング (125-4K) | メモリ 0x00 | `spec:polling_wireless` | **済** (4K 保持を実機確認) | **P0** |
+| LOD (1/2mm) / MotionSync / 直線補正 / リップル | 0x0A/0xAB/0xAF/0xB1 | `spec:lod` ほか Toggle | **済** (反転往復検証) | **P0** |
+| デバウンス (0-30ms) | 0xA9 | `spec:debounce` | **済** | P0 |
+| バッテリー (%・充電中・mV) / FW | cmd4 / cmd 0x12 (パックド10進) | `battery()` / `DeviceInfo::firmware` | **済** (95%→100% 充電、fw 1.21) | P0 |
+| スリープ (10-600秒・10秒刻み) | 0xB7 | `spec:sleep_sec` | **済** (60↔120 往復) | P1 |
+| ボタン割当 (6/8 ボタン・KM 別) | 0x60+slot*4 | `Change::Button`、`MouseCaps::buttons` | **済** (Key 往復+復元検証) | P1 |
+| ショートカット/メディア | 0x100+slot*32 レコード | `ButtonAction::Key` / `Media` | **済** (#30 キャプチャとバイト一致) | P1 |
+| プロファイル 4 | cmd 0x0E/0x0F | `ProfileCaps` / `Change::Profile` | **済** (同値再設定) | P1 |
+| LED (静的/ブリージング・輝度・速度) | 0x4C/0x4E/0x50/0x52 | `LightArea{id:0}` | **済** (効果切替往復) | P1 |
+| 工場リセット | cmd 0x09 | `act:factory_reset` (`danger`) | **済** (送信経路のみ — 破壊的のため未実行) | P2 |
+| 本体側変更の追従 | cmd 0x0A 通知 (DPI/プロファイル) | `HubEvent::StateChanged` | **済** (echo 待ちで拾って通知) | P2 |
+| ドングル休眠検知 | コマンドタイムアウト | `DeviceInfo::asleep` | **済** (ドングル挿し+有線併用で確認) | P2 |
+| マクロ (mode 6) | レコード形式が未解析 | — | 未 | P3 |
+| FW 更新 (DFU) | 不明 | — | 対象外 (Fusion で) | P3 |
+
 
 ## 3. 作業の順番
 

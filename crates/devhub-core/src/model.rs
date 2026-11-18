@@ -70,6 +70,9 @@ pub enum DriverKind {
     Walkplay,
     /// hub.atk.pro / ATK HUB 系 (ATK F1 等。report-8/EEPROM、CID/MID で機種確定)。
     Atk,
+    /// Pulsar Nordic チップセット系 (Xlite V3 / X2V2 等。17B report-8、
+    /// 0x55 チェックサム、CID/MID (cmd1 handshake) で機種確定)。
+    Pulsar,
     /// www.lamzu.net / Aurora 系 (64B feature report、if2 FFFF:00)。
     Lamzu,
     /// 未割り当て (検出だけできる)。
