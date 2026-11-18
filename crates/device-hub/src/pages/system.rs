@@ -56,6 +56,7 @@ impl Shell {
                         DriverKind::Walkplay => "WalkPlay (peq.szwalkplay.com 互換)".into(),
                         DriverKind::Atk => "ATK HUB 互換".into(),
                         DriverKind::Pulsar => "Pulsar (Nordic/Fusion 互換)".into(),
+                        DriverKind::Monsgeek => "MonsGeek (app.monsgeek.com 互換)".into(),
                         DriverKind::Lamzu => "LAMZU Aurora 互換".into(),
                         DriverKind::Unsupported => "未対応".into(),
                     },

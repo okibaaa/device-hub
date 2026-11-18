@@ -28,6 +28,9 @@ mod mousefit8;
 /// Pulsar Nordic 系ドライバ。診断 example (pulsarread) からも使うので公開。
 #[doc(hidden)]
 pub mod pulsar;
+/// MonsGeek (Ry5088) 系ドライバ。診断 example (monsgeekread) からも使うので公開。
+#[doc(hidden)]
+pub mod monsgeek;
 /// 生 HID チャネル。診断 example (axraw 等) が直接フレームを投げるために公開。
 #[doc(hidden)]
 pub mod transport;
@@ -55,6 +58,7 @@ fn driver_ready(kind: DriverKind) -> bool {
         DriverKind::Walkplay => true,
         DriverKind::Atk => true,
         DriverKind::Pulsar => true,
+        DriverKind::Monsgeek => true,
         DriverKind::Lamzu => true,
         DriverKind::Unsupported => false,
     }
@@ -230,6 +234,7 @@ impl HubBackend for RealHub {
             DriverKind::Pulsar => {
                 Arc::new(pulsar::open(dev, info, events, self.detected.clone())?)
             }
+            DriverKind::Monsgeek => Arc::new(monsgeek::open(dev, info, events)?),
             DriverKind::Lamzu => Arc::new(lamzu::open(dev, info, events)?),
             DriverKind::Unsupported => {
                 return Err(HubError::NotImplemented("このデバイスのドライバ"))

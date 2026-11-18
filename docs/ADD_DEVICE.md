@@ -17,6 +17,7 @@
 | Pulsar Xlite V3 (有線) | 3554:F507 | FF02 / 02 | Pulsar (`pulsar.rs`, 17B report-8/メモリマップ) | (Web 版なし — Pulsar Fusion) | **実機検証済** (CID/MID=6/7 機種確定・FW・電池・DPI 4 段+色・ボタン 6・ショートカット Key・LOD・MotionSync・直線補正・リップル・デバウンス・スリープ・ポーリング (4K 保持確認)・プロファイル・LED 効果 — いずれも往復確認。PROTOCOL_NOTES §6) |
 | Pulsar 4K ドングル | 3554:F509 | FF02 / 02 | Pulsar (`pulsar.rs`) | (同上) | **実機確認** (製品文字列 "Pulsar 4K Wireless Receiver"・同一レイアウト・ハンドシェイク中継 CID=6/MID=7。設定中継の全往復は無線運用時に要再確認) |
 | Pulsar 1K ドングル | 3554:F508 | FF02 / 02 (推定) | Pulsar (`pulsar.rs`) | (同上) | 未検証 (同一プロトコルと仮定 — 実機が無い) |
+| MonsGeek FUN60 PRO (有線) | 3151:502D | FFFF / 02 | Monsgeek (`monsgeek.rs`, 64B feature report) | app.monsgeek.com | **実機検証済** (デバイス ID 2304=FUN60 PRO・FW 777・キーマップ 4 層×61 キー・per-key 磁軸 (押下/リリース/RT/死区)・RT 61/61・ポーリング 4K・デバウンス・RTStab・誤入力防止・WASD・LED・プロファイル 4 — 同値往復確認。PROTOCOL_NOTES §7) |
 | ATK F1 Ultimate | 未確定 | 未確定 | 未確定 | (mouse.fit の機種表に無い) | §7 を参照 |
 
 **接続方式でプロトコルが変わる点に注意**: mouse.fit の新プロトコル (64B feature report) は

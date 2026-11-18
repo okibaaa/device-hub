@@ -1223,3 +1223,85 @@ KM=10 の `0x78/0x7C` スロットは FW が別用途に使う (実機: Back/For
 - **未実装/対象外**: マクロ (mode 6 のレコード形式が未解析)、cmd 0x03 status、
   0x54/0x58..0x5F/0xA4..0xA8/0xB5/0xB9/0xBB の不明領域 (書かない)、FW 更新、ペアリング。
 
+## 7. MonsGeek / app.monsgeek.com — Ry5088 ファミリ (FUN60 PRO 有線 3151:502D 実機検証済み)
+
+出典: **実機 FUN60 PRO 有線 (デバイス ID 2304, fw 777) の直接プローブ + ドライバ経由の読み書き往復
+(2026-11-19)** に、公式 Web バンドル (app.monsgeek.com, Vite 遅延チャンク `5b054c21.js` +
+`f84b99a9.js` = Ry5088 系実装) の静的解析を併用。公式の Windows アプリは Electron (ローカル
+デーモン `hid.HidService` @127.0.0.1:3838 経由) だが、WebHID 直と同じ 64B フレーム。
+
+### 7.1 対象デバイス
+
+- **VID 3151 / PID 502D** (Ry5088 系 8K 有線ファームの汎用 PID — 約 30 機種が共用)。
+  機種は **cmd 0x8F (whoAmI) のデバイス ID (u32 LE)** で確定する。実機: **ID 2304 = FUN60 PRO**
+  (`ry5088_akko_fun60pro_1m_8k`)、FW 777 → 行程 ×100 (0.01mm)。
+- 設定チャネル = **interface 2 の FFFF/02 コレクション、feature report** (reportId 0 / 64B ペイロード、
+  Windows では 65B バッファの [1..65])。interface 1 (FFFF/01, input 32B) は デバイス→PC の
+  一方向通知 (プロファイル切替・行程ストリーム等 — Phase 2)。
+
+### 7.2 トランスポート (実機確認)
+
+- フレーム: `[cmd, args.., cksum@byte[7]]` (未使用は 0 パディング)。
+  **cksum (Bit7) = `0xFF - sum(byte[0..7])`**。SET_LEDPARAM だけ **Bit8** (cksum @byte[8]。
+  実機ライト応答もこの形式)。
+- **単純 GET** (`0x84` profile / `0x83` rate / `0x86` debounce / `0x89` KBOPTION / `0x87` light /
+  `0x8F` whoAmI): 応答 `[cmd echo][data..]` — echo で鮮度が保証される。
+- **チャンク GET** (`0x8A` キーマトリクス / `0x90` Fn / `0xE5` 磁軸): 応答は **エコー無しの生 64B
+  データ**。鮮度保証が無いため §7.3 の対策が必要。
+- **応答の遅延と鮮度 (実機で確定した重要挙動)**:
+  1. デバイスは要求を受けてから応答を**非同期に準備**する (通常 ~15ms、連続読み出しの末尾や
+     書き込みコミット中は大幅に長い)。
+  2. 準備完了前の `get_feature` には **「準備中フレーム」** (`[echo or 0][zeros][0xFF-cmd]@7`) か
+     **「直前の応答をそのまま」** (stale) が返る。**stale は本物のデータと区別がつかない**
+     (実機: 46 連続読み出しの末尾で op3 chunk0 が op2 chunk2 の内容を返した)。
+  3. 対策 (monsgeek.rs 実装): idle は p[7]==0xFF-cmd+実質ゼロで判定、stale は
+     **「要求が変わったのに応答バイトが直前と一致」** で判定 → 待って再読み、1 サイクル (5 読み)
+     続いたら要求を再送。**書き込みコミット中は GET が無視され続ける**ため、磁軸バッチ後は
+     **1500ms 待つ** (公式の blockCommonData/vendorSleep に相当。500ms では不足した実測あり)。
+
+### 7.3 コマンド (実機で確認済みのもの)
+
+| cmd | 意味 | 引数 → 応答 |
+|---|---|---|
+| 0x8F | whoAmI | → `[1..5]`=デバイス ID u32 LE、`[7..9]`=FW (low,high)、`[9]`=isBoot |
+| 0x04 / 0x84 | プロファイル設定/取得 | `[1]=idx` / → `[1]` (0..3) |
+| 0x03 / 0x83 | ポーリング設定/取得 | `[2]=enum` (0=8K,1=4K,2=2K,3=1K,4=500,5=250,6=125) / → `[2]` |
+| 0x06 / 0x86 | デバウンス設定/取得 | `[1]=値` / → `[1]` |
+| 0x09 / 0x89 | KBOPTION 設定/取得 | SET `[2]=fn層 [3]=誤入力防止 [4]=RTStab/25 [5]=WASD` / GET → `[1]=system [2]=fn [3]=防誤触 [4]=RTStab [5]=WASD` |
+| 0x07 / 0x87 | LED 設定/取得 (**Bit8**) | `[1]=灯効 [2]=4-速度 [3]=明るさ(0-4) [4]=mode(7 炫彩/8 単色) [5..7]=RGB` |
+| 0x0A / 0x8A | キーマトリクス設定/取得 | SET 単キー: `[1]=profile [2]=keyIdx [5]=persist [6]=son` + **設定値 4B @byte[8..12]** / GET: `[1]=profile [2]=0xFF [3]=chunk` → 64B データ (16 キー/chunk) |
+| 0x65 / 0xE5 | 磁軸設定/取得 | SET 単キー: **8B ヘッダ** `[0x65, op, 0, keyIdx, last, 0, 0]` + cksum@7 + **データ @byte[8..]** (u16 LE または u8) / GET: `[1]=op [2]=1(bulk) [3]=chunk` → 64B (u16 系 32 キー、u8 系 64 キー/chunk) |
+| 0x1C / 0x1E | 最小/最大行程キャリブレーション | `[1]=0/1` (公式: 1 → 2s → 0 → 0x1E[1]=1、終了時 0x1E[1]=0) |
+| 0x01 | 工場リセット | 後 2s 待ち |
+
+**磁軸 op**: 0=押下行程, 1=リリース行程, 2=RT押下, 3=RTリリース, 6=底部死区 (いずれも
+u16 LE × mm×100)、**7=キーモード (u8: bit7=RT 有効、本体 0=通常/2=DKS/3=MT/4,5=TGL/7=Snap)**、
+9=Snap 相手 (0xFF=なし)、251=頂部死区 (FW≥1024 のみ — 実機 777 は未対応)。
+実機 (FUN60 PRO 出荷値): 全キー RT 有効 (0x80)、押下 1.80mm・リリース 2.00mm・
+RT 0.20/0.30mm・死区 0.30mm。
+
+**キーマトリクス 4B レコード** (`matrixToHid`/`hidToMatrix` 相当 — 実機ダンプと公式
+`defaultMatrix` で一致確認): `[0,0,usage,0]`=通常キー、`[0,mods,key,0]`=コンボ、
+usage>0xFF は 32bit BE 分割 `[b31..b24, b23..b16, b15..b8, b7..b0]` (メディア)、
+`[9,type,slot,0]`=マクロ、`[0,0,0,0]`/`[0,0,3,0]`=無効。
+FUN60 の物理配置 = `registry::fun60_layout()` (公式 defaultMatrix から機械抽出。
+matrix idx 0/6/10/11 等は未使用スロット)。
+
+### 7.4 ドライバ実装サマリ (monsgeek.rs — 実装済み・実機検証済み)
+
+- **検出**: VID 3151 / PID 502D / FFFF:02。whoAmI で ID→機種表 (2304=FUN60 PRO 等)。
+- **read()**: profile → スカラー系 → キーマップ 4 プロファイル×6 チャンク → 磁軸
+  (op7×2 + op0/1/6/2/3×3 チャンク) — 実測 **0.1s** (stale 対策込み)。
+- **apply**: ポーリング/デバウンス/RTStab/誤入力防止/WASD (KBOPTION は現在値を読んで
+  全項目保持)、KeyMap (4B レコード往復可能 — コンボ/メディア含む)、KeyPerf
+  (op7/0/1/2/3/6 単キー差分バッチ、last=1 でコミット)、プロファイル、LED (Bit8)。
+- **実機 E2E (2026-11-19)**: 同値書き戻し往復 6 項目 (polling / rt_stab / KeyMap A /
+  **KeyPerf A (op7/0/1/2/3/6)** / Profile / Lighting) — 全て読み戻し一致。
+- **キャリブレーション**: `act:calibrate` (0x1C→2s→0x1E 開始) + `calibrate_finish`
+  (0x1E[1]=0)。行程ストリーム (interface 1 の 0x1B 通知) は Phase 2 のため
+  `PerfCaps::live_travel=false`。
+- **未実装**: Fn 層 (0x90/0x10)、マクロ (0x0B/0x8B)、高度キー (DKS/MT/TGL/Snap の
+  モード 2-7 — 読み出しのみ対応)、カスタム灯効レイヤ (0x0C/0x8C/0x12)、GIF、
+  FW 更新 (0x7F/0xBA)。実機未検証: 書き込み後のプロファイル切替連続動作。
+
+

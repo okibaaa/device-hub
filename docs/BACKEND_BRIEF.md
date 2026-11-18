@@ -127,6 +127,31 @@ mouse.fit の機種表に無い。実機の VID/PID/usage を取り、`docs/ADD_
 | マクロ (mode 6) | レコード形式が未解析 | — | 未 | P3 |
 | FW 更新 (DFU) | 不明 | — | 対象外 (Fusion で) | P3 |
 
+### 2.5 MonsGeek Ry5088 (FUN60 PRO ほか PID 502D 共有 ~30 機種)
+
+公式 Web ドライバ (app.monsgeek.com) のバンドル解析 + 実機プローブで解析。
+**→ 実装済み (`monsgeek.rs`, FUN60 PRO 有線で実機検証、PROTOCOL_NOTES §7 参照)。**
+
+| 機能 | 根拠 | 表し方 | 現状 | 優先 |
+|---|---|---|---|---|
+| 機種確定 (PID 502D 共有) | cmd 0x8F whoAmI → デバイス ID (u32 LE) | `DeviceInfo` の model/name | **済** (実機: 2304 = FUN60 PRO, fw 777) | **P0** |
+| キーマップ (61 キー × 4 オンボード層) | GET 0x8A (4B/キー) / SET 0x0A | `KeyboardState::keymap` / `Change::KeyMap` | **済** (同値往復。コンボ・メディア (32bit) 往復保存) | **P0** |
+| キーごとの磁軸 (押下/リリース/RT押下/RTリリース/死区/モード) | GET/SET 0xE5/0x65 op0-7 | `KeyboardState::perf` / `Change::KeyPerf` / `PerfCaps` | **済** (A キー 6 op 往復検証) | **P0** |
+| ポーリングレート (125-8K) | GET/SET 0x83/0x03 | `spec:polling` | **済** (実機 4K) | **P0** |
+| プロファイル 4 | GET/SET 0x84/0x04 | `ProfileCaps` / `Change::Profile` | **済** (同値再設定) | P1 |
+| RT Stab (0-125%・25 刻み) / 誤入力防止 / WASD↔矢印 | KBOPTION 0x89/0x09 | `spec:rt_stab` / `spec:mistouch` / `spec:wasd_swap` | **済** (同値往復・全項目保持) | P1 |
+| デバウンス | GET/SET 0x86/0x06 | `spec:debounce` | **済** (同値往復) | P1 |
+| バックライト (灯効 11 種・明るさ/速度/RGB) | GET/SET 0x87/0x07 (**Bit8**) | `LightArea{id:0}` | **済** (同値往復) | P1 |
+| 磁軸キャリブレーション | 0x1C (最小) → 2s → 0x1E (最大) | `act:calibrate` / `calibrate_finish` | **済** (経路のみ — 実機で未実行) | P1 |
+| 工場リセット | cmd 0x01 | `act:factory_reset` (`danger`) | **済** (経路のみ — 破壊的のため未実行) | P2 |
+| live_travel (行程ストリーム) | interface 1 (FFFF/01) の 0x1B 通知 | `PerfCaps::live_travel` | 未 (Phase 2 — 現在 false 申告) | P1 |
+| Fn 層 (win/mac × 2) | GET/SET 0x90/0x10 | 契約の追加が必要 | 未 | P2 |
+| マクロ | GET/SET 0x8B/0x0B | `MacroCaps` | 未 (レコード形式は解析済み) | P2 |
+| 高度キー (DKS/MT/TGL/Snap) | op7 モード 2-7 + op4/5/9 | `Advanced` | 未 (読み出しのみ) | P2 |
+| カスタム灯効レイヤ / GIF | 0x0C/0x8C/0x12 | `LightingState::per_key` | 未 | P2 |
+| 軸体タイプ (op252) / 頂部死区 (op251) | FW≥1024 系のみ | — | N/A (実機 fw 777 は未対応) | P3 |
+| FW 更新 | 0x7F / 0xBA (ヘッダ 20480B スキップ) | `act:firmware` | 未 (対象外) | P3 |
+
 
 ## 3. 作業の順番
 
