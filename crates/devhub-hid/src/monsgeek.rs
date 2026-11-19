@@ -33,9 +33,10 @@ use devhub_core::backend::*;
 use devhub_core::model::*;
 use devhub_core::registry;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------- コマンド
 
@@ -116,6 +117,243 @@ pub struct MonsDriver {
     /// 間に合っておらず古い応答が返っている (実機: 長い連続読み出しの
     /// 末尾で観測 — op3 chunk0 が op2 chunk2 の内容を返した)。
     last_chunk: Mutex<Option<([u8; 6], [u8; 64])>>,
+    // ---- live travel (0x1B ストリーム) ----
+    /// リーダースレッドと共有する生センサー値 (matrix index → u16 BE)。
+    live_raw: Arc<Mutex<[u16; 128]>>,
+    /// 各キーの走行最大値 (静止ベースライン自動学習用 — 押すと値が
+    /// **下がる**ホールセンサーのため、max が静止位置)。
+    live_max: Arc<Mutex<[u16; 128]>>,
+    /// ストリーム有効フラグ。
+    live_on: AtomicBool,
+    /// 最後に live_travel() が呼ばれた時刻 (5s 無呼び出しで自動停止)。
+    live_last_poll: Mutex<Option<Instant>>,
+    /// リーダースレッド停止フラグ。
+    live_stop: Arc<AtomicBool>,
+    /// 0x1B 送信用の非 overlapped Win32 handle (**開いたまま保持** —
+    /// 閉じるとデバイスがストリームを止める。実機確認)。
+    live_cfg: Mutex<Option<VendorHandle>>,
+    /// matrix index → layout index (逆引き — デバッグ用)。
+    #[allow(dead_code)]
+    layout_of: [Option<usize>; 128],
+}
+
+/// 0x1B 通知のリーダースレッド: FFFF:01 (interface 1 COL05) の input
+/// report を読み、`[rid=5][0x1B][key][val_hi][val_lo]` を解析して共有
+/// バッファに書き込む。実機: 全センサー を ~8 サイクル/秒で巡回。
+fn live_reader(
+    dev: VendorHandle,
+    raw: Arc<Mutex<[u16; 128]>>,
+    max_v: Arc<Mutex<[u16; 128]>>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut read_count = 0u32;
+    while !stop.load(Ordering::Relaxed) {
+        let mut buf = [0u8; 32];
+        match dev.read_input(&mut buf, 200) {
+            Some(n) if n >= 5 => {
+                read_count += 1;
+                if read_count <= 3 || read_count % 2000 == 0 {
+                    eprintln!(
+                        "  [live_reader] #{read_count} read {n}B: {:02x?}",
+                        &buf[..n.min(6)]
+                    );
+                }
+                if buf[1] == 0x1B {
+                    let key = buf[2] as usize;
+                    if key < 128 {
+                        let val = ((buf[3] as u16) << 8) | buf[4] as u16;
+                        {
+                            let mut r = raw.lock().unwrap_or_else(|p| p.into_inner());
+                            r[key] = val;
+                        }
+                        {
+                            let mut m = max_v.lock().unwrap_or_else(|p| p.into_inner());
+                            if val > m[key] {
+                                m[key] = val;
+                            }
+                        }
+                    }
+                }
+            }
+            Some(_) => {}
+            None => {
+                // timeout — 即ループ
+            }
+        }
+    }
+    eprintln!("  [live_reader] stopped after {read_count} reads");
+}
+
+// ---------------------------------------------------------------- Win32 FFI
+//
+// hidapi の Windows バックエンドは FFFF:01 コレクションから input report を
+// 読み取れないため (実機確認)、通知チャネルだけ生 Win32 API で直叩きする。
+// PowerShell プローブ (CreateFile FILE_FLAG_OVERLAPPED + ReadFile OVERLAPPED)
+// と同一方式 — 追加依存なしの extern 宣言。
+
+#[allow(non_snake_case)]
+mod win32 {
+    pub type HANDLE = *mut core::ffi::c_void;
+    pub const INVALID_HANDLE: HANDLE = core::ptr::null_mut();
+
+    #[repr(C)]
+    pub struct Overlapped {
+        pub Internal: usize,
+        pub InternalHigh: usize,
+        pub Offset: u32,
+        pub OffsetHigh: u32,
+        pub hEvent: HANDLE,
+    }
+
+    extern "system" {
+        pub fn CreateFileW(
+            lpFileName: *const u16,
+            dwDesiredAccess: u32,
+            dwShareMode: u32,
+            lpSecurityAttributes: *const core::ffi::c_void,
+            dwCreationDisposition: u32,
+            dwFlagsAndAttributes: u32,
+            hTemplateFile: HANDLE,
+        ) -> HANDLE;
+        pub fn ReadFile(
+            hFile: HANDLE,
+            lpBuffer: *mut u8,
+            nNumberOfBytesToRead: u32,
+            lpNumberOfBytesRead: *mut u32,
+            lpOverlapped: *mut Overlapped,
+        ) -> i32;
+        pub fn CloseHandle(hObject: HANDLE) -> i32;
+        pub fn CancelIo(hFile: HANDLE) -> i32;
+        pub fn CreateEventW(
+            lpEventAttributes: *const core::ffi::c_void,
+            bManualReset: i32,
+            bInitialState: i32,
+            lpName: *const u16,
+        ) -> HANDLE;
+        pub fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: u32) -> u32;
+        pub fn GetLastError() -> u32;
+    }
+
+    pub const GENERIC_READ_WRITE: u32 = 0xC000_0000;
+    pub const FILE_SHARE_ALL: u32 = 3;
+    pub const OPEN_EXISTING: u32 = 3;
+    pub const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+    pub const ERROR_IO_PENDING: u32 = 997;
+    pub const WAIT_OBJECT_0: u32 = 0;
+}
+
+/// 生 Win32 ハンドルのラッパー (Drop で CloseHandle)。
+pub struct VendorHandle(win32::HANDLE);
+
+// SAFETY: ハンドルはリーダースレッド 1 本からのみ使われ、スレッド間で
+// 移動するのは所有権の移転のみ (参照は共有されない)。
+unsafe impl Send for VendorHandle {}
+unsafe impl Sync for VendorHandle {}
+
+impl VendorHandle {
+    /// overlapped ReadFile で input report を 1 件読む (PS プローブと同一方式)。
+    fn read_input(&self, buf: &mut [u8; 32], timeout_ms: u32) -> Option<usize> {
+        use win32::*;
+        if self.0.is_null() {
+            return None;
+        }
+        let mut bytes_read: u32 = 0;
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return None;
+        }
+        let mut ol = Overlapped {
+            Internal: 0,
+            InternalHigh: 0,
+            Offset: 0,
+            OffsetHigh: 0,
+            hEvent: event,
+        };
+        let ok = unsafe {
+            ReadFile(
+                self.0,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut bytes_read,
+                &mut ol,
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err != ERROR_IO_PENDING {
+                eprintln!("  [live_reader] ReadFile error: {err}");
+                unsafe { CloseHandle(event) };
+                return None;
+            }
+        }
+        let wr = unsafe { WaitForSingleObject(event, timeout_ms) };
+        if wr == WAIT_OBJECT_0 {
+            unsafe { CloseHandle(event) };
+            Some(bytes_read as usize)
+        } else {
+            // timeout — CancelIo で中止
+            unsafe {
+                CancelIo(self.0);
+                // CancelIo 後に GetOverlappedResult で完了確認
+                let mut br: u32 = 0;
+                let ok2 = ReadFile(self.0, buf.as_mut_ptr(), 0, &mut br, &mut ol);
+                let _ = ok2;
+                CloseHandle(event);
+            }
+            None
+        }
+    }
+}
+
+impl Drop for VendorHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { win32::CloseHandle(self.0) };
+        }
+    }
+}
+
+/// FFFF:01 (通知チャネル) を同じ VID/PID から探して **生 Win32 API で**開く。
+fn open_vendor_channel(vid: u16, pid: u16) -> Option<VendorHandle> {
+    use win32::*;
+
+    // hidapi でパスを列挙 (列挙は問題なく動く — 読み取りだけが駄目)。
+    let api = hidapi::HidApi::new().ok()?;
+    let mut target_path: Option<String> = None;
+    for d in api.device_list() {
+        if d.vendor_id() == vid
+            && d.product_id() == pid
+            && d.usage_page() == 0xFFFF
+            && d.usage() == 1
+        {
+            target_path = Some(d.path().to_string_lossy().into_owned());
+            break;
+        }
+    }
+    let path = target_path?;
+    eprintln!("  [monsgeek] vendor path: {path}");
+
+    // 生 Win32 API で開く (**overlapped** — PS プローブと同一: PS の ReadInput
+    // は FILE_FLAG_OVERLAPPED + OVERLAPPED ReadFile で成功している)。
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ_WRITE,
+            FILE_SHARE_ALL,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED, // ← PS プローブと同じ overlapped
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() {
+        let err = unsafe { GetLastError() };
+        eprintln!("  [monsgeek] vendor CreateFileW failed: {err}");
+        return None;
+    }
+    eprintln!("  [monsgeek] vendor Win32 handle opened (overlapped mode)");
+    Some(VendorHandle(handle))
 }
 
 /// Bit7 チェックサム: `0xFF - sum(p[0..7])`。
@@ -136,6 +374,26 @@ pub fn open(
         .iter()
         .map(|k| k.id)
         .collect::<Vec<_>>();
+    // 逆引き表: matrix index → layout index。
+    let mut layout_of: [Option<usize>; 128] = [None; 128];
+    for (li, &mi) in matrix_of.iter().enumerate() {
+        if (mi as usize) < 128 {
+            layout_of[mi as usize] = Some(li);
+        }
+    }
+    let live_raw = Arc::new(Mutex::new([0u16; 128]));
+    let live_max = Arc::new(Mutex::new([0u16; 128]));
+    let live_stop = Arc::new(AtomicBool::new(false));
+    // FFFF:01 (通知チャネル) を開いてリーダースレッドを起動。
+    if let Some(vd) = open_vendor_channel(info.vid, info.pid) {
+        let raw = live_raw.clone();
+        let max_v = live_max.clone();
+        let stop = live_stop.clone();
+        std::thread::Builder::new()
+            .name("monsgeek-live".into())
+            .spawn(move || live_reader(vd, raw, max_v, stop))
+            .ok();
+    }
     let mut d = MonsDriver {
         dev: Mutex::new(dev),
         info: Mutex::new(info),
@@ -144,6 +402,13 @@ pub fn open(
         matrix_of,
         events,
         last_chunk: Mutex::new(None),
+        live_raw,
+        live_max,
+        live_on: AtomicBool::new(false),
+        live_last_poll: Mutex::new(None),
+        live_stop,
+        live_cfg: Mutex::new(None),
+        layout_of,
     };
     // ウォームアップ + 機種確定 (オープン直後の 1 発目は空フレームが返ることがある)。
     for _ in 0..5 {
@@ -509,7 +774,7 @@ fn build_caps() -> Capabilities {
                 switch_ids: vec![],
                 per_key: true,
                 // 0x1B 通知ストリーム (interface 1) は Phase 2 — 今は申告しない。
-                live_travel: false,
+                live_travel: true,
             }),
             advanced: vec![],
             macros: None,
@@ -575,6 +840,17 @@ impl DeviceDriver for MonsDriver {
     }
 
     fn read(&self) -> HubResult<DeviceState> {
+        // live ストリーム自動停止: 5s 無呼び出しなら止める (UI の定期 scan から呼ばれる)。
+        if self.live_on.load(Ordering::Relaxed) {
+            let idle = self
+                .live_last_poll
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none_or(|t| t.elapsed() > Duration::from_secs(5));
+            if idle {
+                let _ = self.live_stream_set(false);
+            }
+        }
         // ---- 現在プロファイル + スカラー設定
         let profile = self.cmd_simple(0x84, &[])?[1].min(3);
         let rate = self.cmd_simple(0x83, &[])?[2].min(6);
@@ -827,6 +1103,8 @@ impl DeviceDriver for MonsDriver {
         match id {
             "calibrate" => {
                 // 公式 setJiaoZhunKaiGuan: 最小行程 → 2s → 最大行程 開始。
+                // live ストリームも ON (公式は 0x1B で行程を監視しつつ校正)。
+                self.live_stream_set(true)?;
                 self.send_set(cmd::SET_MAG_CAL_MIN, &[1], &[], 7)?;
                 sleep(Duration::from_millis(2000));
                 self.send_set(cmd::SET_MAG_CAL_MIN, &[0], &[], 7)?;
@@ -838,6 +1116,7 @@ impl DeviceDriver for MonsDriver {
             }
             "calibrate_finish" => {
                 self.send_set(cmd::SET_MAG_CAL_MAX, &[0], &[], 7)?;
+                self.live_stream_set(false)?;
                 Ok(ActionOutcome {
                     message: Some("キャリブレーションを保存しました".into()),
                     reload: true,
@@ -853,6 +1132,167 @@ impl DeviceDriver for MonsDriver {
             }
             _ => Err(HubError::Unsupported("action")),
         }
+    }
+
+    fn live_travel(&self) -> HubResult<Vec<f32>> {
+        // 遅延開始: 最初の呼び出しで 0x1B ストリームを有効化。
+        if !self.live_on.load(Ordering::Relaxed) {
+            self.live_stream_set(true)?;
+        }
+        *self.live_last_poll.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(Instant::now());
+        let mul = self.mul as f32;
+        let raw = self.live_raw.lock().unwrap_or_else(|p| p.into_inner());
+        let max = self.live_max.lock().unwrap_or_else(|p| p.into_inner());
+        // ホールセンサーは**値が下がる = 押されている** (磁石が近づく)。
+        // travel = (静止値 max - 現在値 raw) / 倍率 → 押し込み深さ mm。
+        Ok(self
+            .matrix_of
+            .iter()
+            .map(|&mi| {
+                let k = mi as usize;
+                let baseline = max[k];
+                let current = raw[k];
+                if baseline == 0 {
+                    0.0 // まだデータが来ていない
+                } else {
+                    let d = baseline.saturating_sub(current) as f32 / mul;
+                    d.clamp(0.0, 4.0)
+                }
+            })
+            .collect())
+    }
+}
+
+impl MonsDriver {
+    /// テスト/デバッグ用: live_raw と live_max の共有バッファのコピーを返す。
+    #[doc(hidden)]
+    pub fn debug_live_buffers(&self) -> ([u16; 128], [u16; 128]) {
+        (
+            *self.live_raw.lock().unwrap_or_else(|p| p.into_inner()),
+            *self.live_max.lock().unwrap_or_else(|p| p.into_inner()),
+        )
+    }
+
+    /// テスト用: live_on を強制的に ON にする (0x1B を送らない)。
+    #[doc(hidden)]
+    pub fn force_live_on_for_test(&self) {
+        self.live_on.store(true, Ordering::Relaxed);
+    }
+
+    /// テスト用: live_stream_set を外部から呼ぶ。
+    #[doc(hidden)]
+    pub fn live_stream_set_public(&self, on: bool) -> HubResult<()> {
+        self.live_stream_set(on)
+    }
+
+    /// 0x1B ライブ行程ストリームの ON/OFF。**config channel への SET は
+    /// 非 overlapped Win32 handle から送る** — hidapi の handle は
+    /// FILE_FLAG_OVERLAPPED で開かれており、HidD_SetFeature がこの上では
+    /// 実際にデバイスへ届かない (実機確認: 0x1B 有効化が無視される)。
+    /// さらに、**0x1B を送った handle は開いたまま保持する必要がある**
+    /// (閉じるとデバイスがストリームを止める — 実機確認)。
+    fn live_stream_set(&self, on: bool) -> HubResult<()> {
+        if on {
+            // 非 overlapped handle を開いて保持。
+            let handle = self.open_raw_cfg()?;
+            self.set_0x1b_on_handle(&handle, 1)?;
+            *self.live_cfg.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
+            self.live_on.store(true, Ordering::Relaxed);
+            sleep(Duration::from_millis(200));
+        } else {
+            // 保持中の handle から disable を送って閉じる。
+            let cfg = self.live_cfg.lock().unwrap_or_else(|p| p.into_inner()).take();
+            if let Some(h) = cfg {
+                let _ = self.set_0x1b_on_handle(&h, 0);
+                // handle は Drop で CloseHandle される
+            }
+            self.live_on.store(false, Ordering::Relaxed);
+            *self.live_max.lock().unwrap_or_else(|p| p.into_inner()) = [0; 128];
+            *self.live_raw.lock().unwrap_or_else(|p| p.into_inner()) = [0; 128];
+        }
+        Ok(())
+    }
+
+    /// config channel (FFFF:02) を非 overlapped Win32 handle で開く。
+    fn open_raw_cfg(&self) -> HubResult<VendorHandle> {
+        use win32::*;
+        let i = self.info.lock().unwrap_or_else(|p| p.into_inner());
+        let api = hidapi::HidApi::new()
+            .map_err(|e| HubError::Io(format!("hidapi: {e}")))?;
+        let path = api
+            .device_list()
+            .find(|d| {
+                d.vendor_id() == i.vid
+                    && d.product_id() == i.pid
+                    && d.usage_page() == 0xFFFF
+                    && d.usage() == 2
+            })
+            .map(|d| d.path().to_string_lossy().into_owned())
+            .ok_or_else(|| HubError::Io("config path not found".into()))?;
+        drop(i);
+
+        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ_WRITE,
+                FILE_SHARE_ALL,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0, // 非 overlapped
+                std::ptr::null_mut(),
+            )
+        };
+        if handle.is_null() {
+            return Err(HubError::Io(format!(
+                "cfg CreateFileW failed: {}",
+                unsafe { GetLastError() }
+            )));
+        }
+        Ok(VendorHandle(handle))
+    }
+
+    /// 0x1B [val] を指定された handle から HidD_SetFeature で送る。
+    fn set_0x1b_on_handle(&self, handle: &VendorHandle, val: u8) -> HubResult<()> {
+        use win32::*;
+
+        let mut payload = [0u8; 64];
+        payload[0] = 0x1B;
+        payload[1] = val;
+        payload[7] = ck7(&payload);
+        let mut report = [0u8; 65];
+        report[0] = 0;
+        report[1..].copy_from_slice(&payload);
+
+        #[link(name = "hid")]
+        extern "system" {
+            #[link_name = "HidD_SetFeature"]
+            fn hid_d_set_feature(
+                hiddeviceobject: HANDLE,
+                hidreport: *mut u8,
+                reportlength: u32,
+            ) -> i32;
+        }
+        let ok = unsafe {
+            hid_d_set_feature(handle.0, report.as_mut_ptr(), report.len() as u32)
+        };
+        if ok == 0 {
+            return Err(HubError::Io("0x1B HidD_SetFeature failed".into()));
+        }
+        eprintln!("  [monsgeek] 0x1B val={val} sent (handle kept open)");
+        Ok(())
+    }
+}
+
+impl Drop for MonsDriver {
+    fn drop(&mut self) {
+        // live ストリーム停止 + handle クローズ。
+        let cfg = self.live_cfg.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(h) = cfg {
+            let _ = self.set_0x1b_on_handle(&h, 0);
+        }
+        self.live_stop.store(true, Ordering::Relaxed);
     }
 }
 
